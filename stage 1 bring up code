@@ -1,0 +1,309 @@
+/*
+ * Ali's Motor Controller - Stage 1 Bring-Up
+ * 
+ * Hardware:
+ *   - ESP32 NodeMCU
+ *   - KY-040 Rotary Encoder (CLK=14, DT=27, SW=32)
+ *   - I2C 20x4 LCD Display (SDA=5, SCL=4)
+ *   - MOSFET driver PWM output (PWM=18, 10kHz)
+ *   - Reed sensor for wheel speed (GPIO25)
+ *
+ * Modes:
+ *   - AUTO:   PWM proportional to speed (0 km/h=0%, 20 km/h=100%)
+ *   - MANUAL: PWM set by rotary encoder (0-100%)
+ *
+ * Controls:
+ *   - Short press: START / STOP
+ *   - Long press (>1s): Switch AUTO <-> MANUAL
+ *   - Rotate: Adjust PWM % (MANUAL mode only)
+ */
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// ─── Pin Definitions ─────────────────────────────────────────
+#define PIN_SDA       5
+#define PIN_SCL       4
+
+#define PIN_ENC_CLK   14
+#define PIN_ENC_DT    27
+#define PIN_ENC_SW    32
+
+#define PIN_PWM       18
+
+#define PIN_REED      25
+
+// ─── PWM Configuration ──────────────────────────────────────
+#define PWM_FREQ      10000   // 10 kHz
+#define PWM_RESOLUTION 8      // 8-bit (0-255)
+
+// ─── Wheel Configuration ────────────────────────────────────
+// >>> SET THIS TO YOUR WHEEL DIAMETER IN mm <<<
+#define WHEEL_DIAMETER_MM  410
+
+// Circumference in meters: pi * d
+const float wheelCircumM = (float)WHEEL_DIAMETER_MM / 1000.0 * PI;
+
+// ─── Auto Mode Configuration ────────────────────────────────
+// Speed at which PWM reaches 100%
+#define AUTO_MAX_SPEED_KMH  20.0
+
+// ─── LCD (address 0x27 is most common, try 0x3F if not working) ─
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// ─── Mode / State ───────────────────────────────────────────
+enum Mode { MODE_MANUAL, MODE_AUTO };
+Mode currentMode = MODE_MANUAL;
+bool motorRunning = false;
+
+// ─── Encoder State ──────────────────────────────────────────
+volatile int  pwmPercent     = 0;       // 0 - 100 (manual)
+volatile bool encoderChanged = false;
+volatile int  lastEncCLK     = HIGH;
+
+// ─── Button State ───────────────────────────────────────────
+bool     buttonDown       = false;
+unsigned long buttonDownTime  = 0;
+bool     longPressHandled = false;
+const unsigned long longPressMs = 1000;  // 1 second
+const unsigned long debounceDelay = 50;  // ms
+unsigned long lastButtonChange = 0;
+
+// ─── Reed Sensor State ──────────────────────────────────────
+volatile unsigned long reedLastPulseUs = 0;
+volatile unsigned long reedPeriodUs    = 0;
+
+// ─── Timing ─────────────────────────────────────────────────
+unsigned long startTime = 0;
+unsigned long lastDisplayUpdate = 0;
+const unsigned long displayInterval = 250; // refresh every 250ms
+
+// Speed goes to 0 if no pulse within this timeout
+const unsigned long reedTimeoutUs = 2000000; // 2 seconds
+
+// ─── Encoder ISR ─────────────────────────────────────────────
+void IRAM_ATTR encoderISR() {
+  int clkState = digitalRead(PIN_ENC_CLK);
+  int dtState  = digitalRead(PIN_ENC_DT);
+
+  if (clkState != lastEncCLK && clkState == LOW) {
+    if (dtState != clkState) {
+      if (pwmPercent < 100) pwmPercent++;
+    } else {
+      if (pwmPercent > 0) pwmPercent--;
+    }
+    encoderChanged = true;
+  }
+  lastEncCLK = clkState;
+}
+
+// ─── Reed Sensor ISR ─────────────────────────────────────────
+void IRAM_ATTR reedISR() {
+  unsigned long now = micros();
+  unsigned long elapsed = now - reedLastPulseUs;
+
+  // Debounce: ignore pulses faster than 5ms (=12000 RPM)
+  if (elapsed < 5000) return;
+
+  reedPeriodUs = elapsed;
+  reedLastPulseUs = now;
+}
+
+// ─── Get Speed in km/h ──────────────────────────────────────
+float getSpeedKmh() {
+  unsigned long period;
+  unsigned long lastPulse;
+
+  noInterrupts();
+  period    = reedPeriodUs;
+  lastPulse = reedLastPulseUs;
+  interrupts();
+
+  if (period == 0) return 0.0;
+  if ((micros() - lastPulse) > reedTimeoutUs) return 0.0;
+
+  float rps = 1000000.0 / (float)period;
+  float ms = rps * wheelCircumM;
+  float kmh = ms * 3.6;
+  if (kmh > 40.0) return 0.0;  // noise spike, discard
+  return kmh;
+}
+
+// ─── Get Active PWM % ───────────────────────────────────────
+int getActivePwmPercent() {
+  if (!motorRunning) return 0;
+
+  if (currentMode == MODE_MANUAL) {
+    return pwmPercent;
+  } else {
+    // AUTO: linear map 0 km/h -> 0%, AUTO_MAX_SPEED_KMH -> 100%
+    float kmh = getSpeedKmh();
+    float pct = (kmh / AUTO_MAX_SPEED_KMH) * 100.0;
+    if (pct < 0.0) pct = 0.0;
+    if (pct > 100.0) pct = 100.0;
+    return (int)pct;
+  }
+}
+
+// ─── Apply PWM ───────────────────────────────────────────────
+void applyPWM() {
+  int pct = getActivePwmPercent();
+  uint32_t duty = map(pct, 0, 100, 0, 255);
+  ledcWrite(PIN_PWM, duty);
+}
+
+// ─── Update Display ──────────────────────────────────────────
+void updateDisplay() {
+  char line[21];
+
+  // Row 0: Mode
+  lcd.setCursor(0, 0);
+  if (currentMode == MODE_AUTO) {
+    lcd.print("Ali's ctrl [AUTO]   ");
+  } else {
+    lcd.print("Ali's ctrl [MANUAL] ");
+  }
+
+  // Row 1: PWM output %
+  int activePwm = getActivePwmPercent();
+  if (currentMode == MODE_MANUAL) {
+    snprintf(line, sizeof(line), "PWM: %3d%%           ", activePwm);
+  } else {
+    // In AUTO, show both speed-derived PWM and target speed
+    snprintf(line, sizeof(line), "PWM: %3d%% (auto)    ", activePwm);
+  }
+  lcd.setCursor(0, 1);
+  lcd.print(line);
+
+  // Row 2: Speed
+  float kmh = getSpeedKmh();
+  char speedStr[8];
+  dtostrf(kmh, 5, 1, speedStr);
+  snprintf(line, sizeof(line), "Speed:%s km/h   ", speedStr);
+  lcd.setCursor(0, 2);
+  lcd.print(line);
+
+  // Row 3: State + uptime
+  unsigned long seconds = (millis() - startTime) / 1000;
+  unsigned long mins = seconds / 60;
+  unsigned long secs = seconds % 60;
+  if (motorRunning) {
+    snprintf(line, sizeof(line), "RUN  %4lu:%02lu        ", mins, secs);
+  } else {
+    snprintf(line, sizeof(line), "STOP %4lu:%02lu        ", mins, secs);
+  }
+  lcd.setCursor(0, 3);
+  lcd.print(line);
+}
+
+// ─── Handle Button (short press / long press) ───────────────
+void handleButton() {
+  bool raw = digitalRead(PIN_ENC_SW);
+
+  // Debounce
+  if ((millis() - lastButtonChange) < debounceDelay) return;
+
+  // Button just pressed
+  if (raw == LOW && !buttonDown) {
+    buttonDown = true;
+    buttonDownTime = millis();
+    longPressHandled = false;
+    lastButtonChange = millis();
+  }
+
+  // Button held — check for long press
+  if (raw == LOW && buttonDown && !longPressHandled) {
+    if ((millis() - buttonDownTime) >= longPressMs) {
+      // ── Long press: switch mode ──
+      if (currentMode == MODE_AUTO) {
+        currentMode = MODE_MANUAL;
+      } else {
+        currentMode = MODE_AUTO;
+      }
+      longPressHandled = true;
+      applyPWM();
+
+      Serial.print("Mode: ");
+      Serial.println(currentMode == MODE_AUTO ? "AUTO" : "MANUAL");
+    }
+  }
+
+  // Button released
+  if (raw == HIGH && buttonDown) {
+    // ── Short press: start/stop (only if long press wasn't triggered) ──
+    if (!longPressHandled) {
+      motorRunning = !motorRunning;
+      applyPWM();
+
+      Serial.print("Motor ");
+      Serial.println(motorRunning ? "STARTED" : "STOPPED");
+    }
+    buttonDown = false;
+    lastButtonChange = millis();
+  }
+}
+
+// ─── Setup ───────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Ali's Motor Controller - Stage 1 Bring-Up");
+
+  // I2C on custom pins
+  Wire.begin(PIN_SDA, PIN_SCL);
+
+  // LCD init
+  lcd.init();
+  lcd.backlight();
+
+  // Encoder pins
+  pinMode(PIN_ENC_CLK, INPUT_PULLUP);
+  pinMode(PIN_ENC_DT,  INPUT_PULLUP);
+  pinMode(PIN_ENC_SW,  INPUT_PULLUP);
+
+  lastEncCLK = digitalRead(PIN_ENC_CLK);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_CLK), encoderISR, CHANGE);
+
+  // Reed sensor pin
+  pinMode(PIN_REED, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_REED), reedISR, FALLING);
+
+  // PWM setup (ESP32 Core 3.x API)
+  ledcAttach(PIN_PWM, PWM_FREQ, PWM_RESOLUTION);
+  ledcWrite(PIN_PWM, 0);
+
+  startTime = millis();
+  updateDisplay();
+
+  Serial.println("Setup complete.");
+  Serial.print("Wheel: ");
+  Serial.print(WHEEL_DIAMETER_MM);
+  Serial.print("mm, circumference: ");
+  Serial.print(wheelCircumM, 3);
+  Serial.println("m");
+  Serial.println("Short press: START/STOP | Long press: AUTO/MANUAL");
+}
+
+// ─── Loop ────────────────────────────────────────────────────
+void loop() {
+  // ── Handle button (short = start/stop, long = mode switch) ──
+  handleButton();
+
+  // ── Handle encoder rotation (MANUAL mode PWM adjustment) ──
+  if (encoderChanged) {
+    encoderChanged = false;
+    if (currentMode == MODE_MANUAL) {
+      applyPWM();
+    }
+  }
+
+  // ── AUTO mode: continuously update PWM based on speed ──
+  if (currentMode == MODE_AUTO && motorRunning) {
+    applyPWM();
+  }
+
+  // ── Periodic display refresh ──
+  if ((millis() - lastDisplayUpdate) > displayInterval) {
+    lastDisplayUpdate = millis();
+    updateDisplay();
+  }
+}
