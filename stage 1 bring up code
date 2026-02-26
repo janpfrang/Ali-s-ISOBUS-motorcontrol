@@ -3,10 +3,12 @@
  * 
  * Hardware:
  *   - ESP32 NodeMCU
- *   - KY-040 Rotary Encoder (CLK=14, DT=27, SW=32)
- *   - I2C 20x4 LCD Display (SDA=5, SCL=4)
- *   - MOSFET driver PWM output (PWM=18, 10kHz)
- *   - Reed sensor for wheel speed (GPIO25)
+ *   - KY-040 Rotary Encoder (CLK=27, DT=26, SW=25)
+ *   - I2C 20x4 LCD Display (SDA=13, SCL=14)
+ *   - MOSFET driver PWM output (PWM=15, 10kHz)
+ *   - Reed sensor for wheel speed (GPIO19)
+ *   - [Stage 2] CAN transceiver SN65HVD230 (TX=22, RX=21)
+ *   - [Stage 2] Inductive lift sensor via PCF817 optocoupler (GPIO23)
  *
  * Modes:
  *   - AUTO:   PWM proportional to speed (0 km/h=0%, 20 km/h=100%)
@@ -22,16 +24,21 @@
 #include <LiquidCrystal_I2C.h>
 
 // ─── Pin Definitions ─────────────────────────────────────────
-#define PIN_SDA       5
-#define PIN_SCL       4
+#define PIN_SDA       13
+#define PIN_SCL       14
 
-#define PIN_ENC_CLK   14
-#define PIN_ENC_DT    27
-#define PIN_ENC_SW    32
+#define PIN_ENC_CLK   27
+#define PIN_ENC_DT    26
+#define PIN_ENC_SW    25
 
-#define PIN_PWM       18
+#define PIN_PWM       15
 
-#define PIN_REED      25
+#define PIN_REED      19
+
+// ─── Stage 2 Pins (reserved, not yet used) ──────────────────
+#define PIN_CAN_TX    22
+#define PIN_CAN_RX    21
+#define PIN_LIFT_IN   23      // Inductive sensor via PCF817 optocoupler
 
 // ─── PWM Configuration ──────────────────────────────────────
 #define PWM_FREQ      10000   // 10 kHz
