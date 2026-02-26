@@ -7,15 +7,20 @@
  *   - I2C 20x4 LCD Display (SDA=13, SCL=14)
  *   - MOSFET driver PWM output (PWM=15, 10kHz)
  *   - Reed sensor for wheel speed (GPIO19)
+ *   - Inductive sensor via PCF817 optocoupler (GPIO23)
  *   - [Stage 2] CAN transceiver SN65HVD230 (TX=22, RX=21)
- *   - [Stage 2] Inductive lift sensor via PCF817 optocoupler (GPIO23)
  *
  * Modes:
  *   - AUTO:   PWM proportional to speed (0 km/h=0%, 20 km/h=100%)
  *   - MANUAL: PWM set by rotary encoder (0-100%)
  *
+ * Speed sources:
+ *   - REED: 1 pulse per wheel revolution (410mm wheel)
+ *   - IND:  Inductive sensor, 7.77 pulses per meter
+ *
  * Controls:
- *   - Short press: START / STOP
+ *   - Short press:  START / STOP
+ *   - Double press: Switch speed sensor (REED <-> IND)
  *   - Long press (>1s): Switch AUTO <-> MANUAL
  *   - Rotate: Adjust PWM % (MANUAL mode only)
  */
@@ -34,11 +39,12 @@
 #define PIN_PWM       15
 
 #define PIN_REED      19
+#define PIN_INDUCTIVE 23      // Inductive sensor via PCF817 optocoupler
 
 // ─── Stage 2 Pins (reserved, not yet used) ──────────────────
 #define PIN_CAN_TX    22
 #define PIN_CAN_RX    21
-#define PIN_LIFT_IN   23      // Inductive sensor via PCF817 optocoupler
+// PIN_LIFT_IN: TBD — needs own GPIO, separate from PIN_INDUCTIVE
 
 // ─── PWM Configuration ──────────────────────────────────────
 #define PWM_FREQ      10000   // 10 kHz
@@ -51,8 +57,11 @@
 // Circumference in meters: pi * d
 const float wheelCircumM = (float)WHEEL_DIAMETER_MM / 1000.0 * PI;
 
+// ─── Inductive Sensor Configuration ─────────────────────────
+// Pulses per meter of ground travel
+#define INDUCTIVE_PULSES_PER_M  7.77
+
 // ─── Auto Mode Configuration ────────────────────────────────
-// Speed at which PWM reaches 100%
 #define AUTO_MAX_SPEED_KMH  20.0
 
 // ─── LCD (address 0x27 is most common, try 0x3F if not working) ─
@@ -60,7 +69,10 @@ LiquidCrystal_I2C lcd(0x27, 20, 4);
 
 // ─── Mode / State ───────────────────────────────────────────
 enum Mode { MODE_MANUAL, MODE_AUTO };
+enum SpeedSource { SRC_REED, SRC_INDUCTIVE };
+
 Mode currentMode = MODE_MANUAL;
+SpeedSource speedSource = SRC_REED;
 bool motorRunning = false;
 
 // ─── Encoder State ──────────────────────────────────────────
@@ -72,21 +84,29 @@ volatile int  lastEncCLK     = HIGH;
 bool     buttonDown       = false;
 unsigned long buttonDownTime  = 0;
 bool     longPressHandled = false;
-const unsigned long longPressMs = 1000;  // 1 second
-const unsigned long debounceDelay = 50;  // ms
+const unsigned long longPressMs = 1000;       // 1 second for long press
+const unsigned long debounceDelay = 50;       // ms
+const unsigned long doublePressMs = 400;      // max gap between double press
 unsigned long lastButtonChange = 0;
+unsigned long lastReleaseTime  = 0;
+bool     waitingSecondPress = false;
+bool     startStopPending   = false;
 
 // ─── Reed Sensor State ──────────────────────────────────────
 volatile unsigned long reedLastPulseUs = 0;
 volatile unsigned long reedPeriodUs    = 0;
 
+// ─── Inductive Sensor State ─────────────────────────────────
+volatile unsigned long indLastPulseUs = 0;
+volatile unsigned long indPeriodUs    = 0;
+
 // ─── Timing ─────────────────────────────────────────────────
 unsigned long startTime = 0;
 unsigned long lastDisplayUpdate = 0;
-const unsigned long displayInterval = 250; // refresh every 250ms
+const unsigned long displayInterval = 250;
 
 // Speed goes to 0 if no pulse within this timeout
-const unsigned long reedTimeoutUs = 2000000; // 2 seconds
+const unsigned long sensorTimeoutUs = 2000000; // 2 seconds
 
 // ─── Encoder ISR ─────────────────────────────────────────────
 void IRAM_ATTR encoderISR() {
@@ -109,15 +129,27 @@ void IRAM_ATTR reedISR() {
   unsigned long now = micros();
   unsigned long elapsed = now - reedLastPulseUs;
 
-  // Debounce: ignore pulses faster than 5ms (=12000 RPM)
+  // Debounce: ignore pulses faster than 5ms
   if (elapsed < 5000) return;
 
   reedPeriodUs = elapsed;
   reedLastPulseUs = now;
 }
 
-// ─── Get Speed in km/h ──────────────────────────────────────
-float getSpeedKmh() {
+// ─── Inductive Sensor ISR ────────────────────────────────────
+void IRAM_ATTR inductiveISR() {
+  unsigned long now = micros();
+  unsigned long elapsed = now - indLastPulseUs;
+
+  // Debounce: ignore pulses faster than 2ms (~500 Hz max)
+  if (elapsed < 2000) return;
+
+  indPeriodUs = elapsed;
+  indLastPulseUs = now;
+}
+
+// ─── Get Speed in km/h (from reed sensor) ───────────────────
+float getSpeedReed() {
   unsigned long period;
   unsigned long lastPulse;
 
@@ -127,13 +159,44 @@ float getSpeedKmh() {
   interrupts();
 
   if (period == 0) return 0.0;
-  if ((micros() - lastPulse) > reedTimeoutUs) return 0.0;
+  if ((micros() - lastPulse) > sensorTimeoutUs) return 0.0;
 
+  // 1 pulse per revolution
   float rps = 1000000.0 / (float)period;
   float ms = rps * wheelCircumM;
   float kmh = ms * 3.6;
-  if (kmh > 40.0) return 0.0;  // noise spike, discard
+  if (kmh > 40.0) return 0.0;
   return kmh;
+}
+
+// ─── Get Speed in km/h (from inductive sensor) ──────────────
+float getSpeedInductive() {
+  unsigned long period;
+  unsigned long lastPulse;
+
+  noInterrupts();
+  period    = indPeriodUs;
+  lastPulse = indLastPulseUs;
+  interrupts();
+
+  if (period == 0) return 0.0;
+  if ((micros() - lastPulse) > sensorTimeoutUs) return 0.0;
+
+  // 7.77 pulses per meter → distance per pulse = 1/7.77 m
+  float pulsesPerSec = 1000000.0 / (float)period;
+  float ms = pulsesPerSec / INDUCTIVE_PULSES_PER_M;  // m/s
+  float kmh = ms * 3.6;
+  if (kmh > 40.0) return 0.0;
+  return kmh;
+}
+
+// ─── Get Speed from active source ────────────────────────────
+float getSpeedKmh() {
+  if (speedSource == SRC_REED) {
+    return getSpeedReed();
+  } else {
+    return getSpeedInductive();
+  }
 }
 
 // ─── Get Active PWM % ───────────────────────────────────────
@@ -143,7 +206,6 @@ int getActivePwmPercent() {
   if (currentMode == MODE_MANUAL) {
     return pwmPercent;
   } else {
-    // AUTO: linear map 0 km/h -> 0%, AUTO_MAX_SPEED_KMH -> 100%
     float kmh = getSpeedKmh();
     float pct = (kmh / AUTO_MAX_SPEED_KMH) * 100.0;
     if (pct < 0.0) pct = 0.0;
@@ -163,20 +225,18 @@ void applyPWM() {
 void updateDisplay() {
   char line[21];
 
-  // Row 0: Mode
+  // Row 0: Mode + sensor source
+  const char* modeStr   = (currentMode == MODE_AUTO) ? "AUTO" : "MANU";
+  const char* sensorStr = (speedSource == SRC_REED) ? "REED" : "IND";
+  snprintf(line, sizeof(line), "Ali [%-4s] spd:%-4s ", modeStr, sensorStr);
   lcd.setCursor(0, 0);
-  if (currentMode == MODE_AUTO) {
-    lcd.print("Ali's ctrl [AUTO]   ");
-  } else {
-    lcd.print("Ali's ctrl [MANUAL] ");
-  }
+  lcd.print(line);
 
   // Row 1: PWM output %
   int activePwm = getActivePwmPercent();
   if (currentMode == MODE_MANUAL) {
     snprintf(line, sizeof(line), "PWM: %3d%%           ", activePwm);
   } else {
-    // In AUTO, show both speed-derived PWM and target speed
     snprintf(line, sizeof(line), "PWM: %3d%% (auto)    ", activePwm);
   }
   lcd.setCursor(0, 1);
@@ -203,24 +263,54 @@ void updateDisplay() {
   lcd.print(line);
 }
 
-// ─── Handle Button (short press / long press) ───────────────
+// ─── Execute Start/Stop ──────────────────────────────────────
+void doStartStop() {
+  motorRunning = !motorRunning;
+  applyPWM();
+  Serial.print("Motor ");
+  Serial.println(motorRunning ? "STARTED" : "STOPPED");
+}
+
+// ─── Execute Sensor Switch ───────────────────────────────────
+void doSensorSwitch() {
+  if (speedSource == SRC_REED) {
+    speedSource = SRC_INDUCTIVE;
+  } else {
+    speedSource = SRC_REED;
+  }
+  applyPWM();
+  Serial.print("Sensor: ");
+  Serial.println(speedSource == SRC_REED ? "REED" : "INDUCTIVE");
+}
+
+// ─── Handle Button (short / double / long press) ────────────
 void handleButton() {
   bool raw = digitalRead(PIN_ENC_SW);
+  unsigned long now = millis();
 
   // Debounce
-  if ((millis() - lastButtonChange) < debounceDelay) return;
+  if ((now - lastButtonChange) < debounceDelay) return;
 
   // Button just pressed
   if (raw == LOW && !buttonDown) {
     buttonDown = true;
-    buttonDownTime = millis();
+    buttonDownTime = now;
     longPressHandled = false;
-    lastButtonChange = millis();
+    lastButtonChange = now;
+
+    // Check if this is the second press of a double-press
+    if (waitingSecondPress && (now - lastReleaseTime) <= doublePressMs) {
+      // ── Double press: switch sensor ──
+      doSensorSwitch();
+      waitingSecondPress = false;
+      startStopPending = false;
+      longPressHandled = true;  // prevent long press from also firing
+    }
   }
 
   // Button held — check for long press
   if (raw == LOW && buttonDown && !longPressHandled) {
-    if ((millis() - buttonDownTime) >= longPressMs) {
+    if ((now - buttonDownTime) >= longPressMs) {
       // ── Long press: switch mode ──
       if (currentMode == MODE_AUTO) {
         currentMode = MODE_MANUAL;
@@ -228,6 +318,8 @@ void handleButton() {
         currentMode = MODE_AUTO;
       }
       longPressHandled = true;
+      waitingSecondPress = false;
+      startStopPending = false;
       applyPWM();
 
       Serial.print("Mode: ");
@@ -237,16 +329,26 @@ void handleButton() {
 
   // Button released
   if (raw == HIGH && buttonDown) {
-    // ── Short press: start/stop (only if long press wasn't triggered) ──
-    if (!longPressHandled) {
-      motorRunning = !motorRunning;
-      applyPWM();
-
-      Serial.print("Motor ");
-      Serial.println(motorRunning ? "STARTED" : "STOPPED");
-    }
     buttonDown = false;
-    lastButtonChange = millis();
+    lastButtonChange = now;
+
+    if (!longPressHandled) {
+      // First short press — wait for possible second press
+      if (!waitingSecondPress) {
+        waitingSecondPress = true;
+        startStopPending = true;
+        lastReleaseTime = now;
+      }
+    }
+  }
+
+  // Timeout: if waiting for second press and it didn't come, execute start/stop
+  if (waitingSecondPress && !buttonDown && startStopPending) {
+    if ((now - lastReleaseTime) > doublePressMs) {
+      doStartStop();
+      waitingSecondPress = false;
+      startStopPending = false;
+    }
   }
 }
 
@@ -274,6 +376,10 @@ void setup() {
   pinMode(PIN_REED, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_REED), reedISR, FALLING);
 
+  // Inductive sensor pin (PC817 module has onboard pull-up)
+  pinMode(PIN_INDUCTIVE, INPUT);
+  attachInterrupt(digitalPinToInterrupt(PIN_INDUCTIVE), inductiveISR, FALLING);
+
   // PWM setup (ESP32 Core 3.x API)
   ledcAttach(PIN_PWM, PWM_FREQ, PWM_RESOLUTION);
   ledcWrite(PIN_PWM, 0);
@@ -287,12 +393,15 @@ void setup() {
   Serial.print("mm, circumference: ");
   Serial.print(wheelCircumM, 3);
   Serial.println("m");
-  Serial.println("Short press: START/STOP | Long press: AUTO/MANUAL");
+  Serial.print("Inductive: ");
+  Serial.print(INDUCTIVE_PULSES_PER_M);
+  Serial.println(" pulses/m");
+  Serial.println("Short: START/STOP | Double: sensor | Long: AUTO/MANUAL");
 }
 
 // ─── Loop ────────────────────────────────────────────────────
 void loop() {
-  // ── Handle button (short = start/stop, long = mode switch) ──
+  // ── Handle button (short/double/long press) ──
   handleButton();
 
   // ── Handle encoder rotation (MANUAL mode PWM adjustment) ──
