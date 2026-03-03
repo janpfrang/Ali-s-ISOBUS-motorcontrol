@@ -16,7 +16,7 @@
  *
  * Speed sources:
  *   - REED: 1 pulse per wheel revolution (410mm wheel)
- *   - IND:  Inductive sensor, 7.77 pulses per meter
+ *   - IND:  Inductive sensor, 7.34 pulses per meter
  *
  * Controls:
  *   - Short press:  START / STOP
@@ -28,7 +28,7 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
-// ─── Pin Definitions ─────────────────────────────────────────
+// --- Pin Definitions ---------------------------------------------------------
 #define PIN_SDA       13
 #define PIN_SCL       14
 
@@ -41,33 +41,33 @@
 #define PIN_REED      19
 #define PIN_INDUCTIVE 23      // Inductive sensor via PCF817 optocoupler
 
-// ─── Stage 2 Pins (reserved, not yet used) ──────────────────
+// --- Stage 2 Pins (reserved, not yet used) -----------------------------------
 #define PIN_CAN_TX    22
 #define PIN_CAN_RX    21
-// PIN_LIFT_IN: TBD — needs own GPIO, separate from PIN_INDUCTIVE
 
-// ─── PWM Configuration ──────────────────────────────────────
+// --- PWM Configuration -------------------------------------------------------
 #define PWM_FREQ      10000   // 10 kHz
 #define PWM_RESOLUTION 8      // 8-bit (0-255)
 
-// ─── Wheel Configuration ────────────────────────────────────
+// --- Wheel Configuration -----------------------------------------------------
 // >>> SET THIS TO YOUR WHEEL DIAMETER IN mm <<<
 #define WHEEL_DIAMETER_MM  410
 
 // Circumference in meters: pi * d
 const float wheelCircumM = (float)WHEEL_DIAMETER_MM / 1000.0 * PI;
 
-// ─── Inductive Sensor Configuration ─────────────────────────
+// --- Inductive Sensor Configuration ------------------------------------------
 // Pulses per meter of ground travel
-#define INDUCTIVE_PULSES_PER_M  7.77
+#define INDUCTIVE_PULSES_PER_M  7.34
 
-// ─── Auto Mode Configuration ────────────────────────────────
+// --- Auto Mode Configuration -------------------------------------------------
+// Speed at which PWM reaches 100%
 #define AUTO_MAX_SPEED_KMH  20.0
 
-// ─── LCD (address 0x27 is most common, try 0x3F if not working) ─
+// --- LCD (address 0x27 is most common, try 0x3F if not working) --------------
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
-// ─── Mode / State ───────────────────────────────────────────
+// --- Mode / State ------------------------------------------------------------
 enum Mode { MODE_MANUAL, MODE_AUTO };
 enum SpeedSource { SRC_REED, SRC_INDUCTIVE };
 
@@ -75,12 +75,12 @@ Mode currentMode = MODE_MANUAL;
 SpeedSource speedSource = SRC_REED;
 bool motorRunning = false;
 
-// ─── Encoder State ──────────────────────────────────────────
+// --- Encoder State -----------------------------------------------------------
 volatile int  pwmPercent     = 0;       // 0 - 100 (manual)
 volatile bool encoderChanged = false;
 volatile int  lastEncCLK     = HIGH;
 
-// ─── Button State ───────────────────────────────────────────
+// --- Button State ------------------------------------------------------------
 bool     buttonDown       = false;
 unsigned long buttonDownTime  = 0;
 bool     longPressHandled = false;
@@ -92,15 +92,15 @@ unsigned long lastReleaseTime  = 0;
 bool     waitingSecondPress = false;
 bool     startStopPending   = false;
 
-// ─── Reed Sensor State ──────────────────────────────────────
+// --- Reed Sensor State -------------------------------------------------------
 volatile unsigned long reedLastPulseUs = 0;
 volatile unsigned long reedPeriodUs    = 0;
 
-// ─── Inductive Sensor State ─────────────────────────────────
+// --- Inductive Sensor State --------------------------------------------------
 volatile unsigned long indLastPulseUs = 0;
 volatile unsigned long indPeriodUs    = 0;
 
-// ─── Timing ─────────────────────────────────────────────────
+// --- Timing ------------------------------------------------------------------
 unsigned long startTime = 0;
 unsigned long lastDisplayUpdate = 0;
 const unsigned long displayInterval = 250;
@@ -108,7 +108,7 @@ const unsigned long displayInterval = 250;
 // Speed goes to 0 if no pulse within this timeout
 const unsigned long sensorTimeoutUs = 2000000; // 2 seconds
 
-// ─── Encoder ISR ─────────────────────────────────────────────
+// --- Encoder ISR -------------------------------------------------------------
 void IRAM_ATTR encoderISR() {
   int clkState = digitalRead(PIN_ENC_CLK);
   int dtState  = digitalRead(PIN_ENC_DT);
@@ -124,7 +124,7 @@ void IRAM_ATTR encoderISR() {
   lastEncCLK = clkState;
 }
 
-// ─── Reed Sensor ISR ─────────────────────────────────────────
+// --- Reed Sensor ISR ---------------------------------------------------------
 void IRAM_ATTR reedISR() {
   unsigned long now = micros();
   unsigned long elapsed = now - reedLastPulseUs;
@@ -136,19 +136,20 @@ void IRAM_ATTR reedISR() {
   reedLastPulseUs = now;
 }
 
-// ─── Inductive Sensor ISR ────────────────────────────────────
+// --- Inductive Sensor ISR (PC817 optocoupler debounce) -----------------------
 void IRAM_ATTR inductiveISR() {
   unsigned long now = micros();
   unsigned long elapsed = now - indLastPulseUs;
 
-  // Debounce: ignore pulses faster than 2ms (~500 Hz max)
-  if (elapsed < 2000) return;
+  // Debounce: 10ms for PC817 optocoupler slow edges
+  // Still safe: min real period ~12.25ms at 40 km/h (7.34 p/m)
+  if (elapsed < 10000) return;
 
   indPeriodUs = elapsed;
   indLastPulseUs = now;
 }
 
-// ─── Get Speed in km/h (from reed sensor) ───────────────────
+// --- Get Speed in km/h (from reed sensor) ------------------------------------
 float getSpeedReed() {
   unsigned long period;
   unsigned long lastPulse;
@@ -169,7 +170,7 @@ float getSpeedReed() {
   return kmh;
 }
 
-// ─── Get Speed in km/h (from inductive sensor) ──────────────
+// --- Get Speed in km/h (from inductive sensor) -------------------------------
 float getSpeedInductive() {
   unsigned long period;
   unsigned long lastPulse;
@@ -182,7 +183,7 @@ float getSpeedInductive() {
   if (period == 0) return 0.0;
   if ((micros() - lastPulse) > sensorTimeoutUs) return 0.0;
 
-  // 7.77 pulses per meter → distance per pulse = 1/7.77 m
+  // 7.34 pulses per meter -> distance per pulse = 1/7.34 m
   float pulsesPerSec = 1000000.0 / (float)period;
   float ms = pulsesPerSec / INDUCTIVE_PULSES_PER_M;  // m/s
   float kmh = ms * 3.6;
@@ -190,7 +191,7 @@ float getSpeedInductive() {
   return kmh;
 }
 
-// ─── Get Speed from active source ────────────────────────────
+// --- Get Speed from active source --------------------------------------------
 float getSpeedKmh() {
   if (speedSource == SRC_REED) {
     return getSpeedReed();
@@ -199,7 +200,7 @@ float getSpeedKmh() {
   }
 }
 
-// ─── Get Active PWM % ───────────────────────────────────────
+// --- Get Active PWM % --------------------------------------------------------
 int getActivePwmPercent() {
   if (!motorRunning) return 0;
 
@@ -214,14 +215,14 @@ int getActivePwmPercent() {
   }
 }
 
-// ─── Apply PWM ───────────────────────────────────────────────
+// --- Apply PWM ---------------------------------------------------------------
 void applyPWM() {
   int pct = getActivePwmPercent();
   uint32_t duty = map(pct, 0, 100, 0, 255);
   ledcWrite(PIN_PWM, duty);
 }
 
-// ─── Update Display ──────────────────────────────────────────
+// --- Update Display ----------------------------------------------------------
 void updateDisplay() {
   char line[21];
 
@@ -263,7 +264,7 @@ void updateDisplay() {
   lcd.print(line);
 }
 
-// ─── Execute Start/Stop ──────────────────────────────────────
+// --- Execute Start/Stop ------------------------------------------------------
 void doStartStop() {
   motorRunning = !motorRunning;
   applyPWM();
@@ -271,7 +272,7 @@ void doStartStop() {
   Serial.println(motorRunning ? "STARTED" : "STOPPED");
 }
 
-// ─── Execute Sensor Switch ───────────────────────────────────
+// --- Execute Sensor Switch ---------------------------------------------------
 void doSensorSwitch() {
   if (speedSource == SRC_REED) {
     speedSource = SRC_INDUCTIVE;
@@ -283,7 +284,7 @@ void doSensorSwitch() {
   Serial.println(speedSource == SRC_REED ? "REED" : "INDUCTIVE");
 }
 
-// ─── Handle Button (short / double / long press) ────────────
+// --- Handle Button (short / double / long press) -----------------------------
 void handleButton() {
   bool raw = digitalRead(PIN_ENC_SW);
   unsigned long now = millis();
@@ -300,7 +301,7 @@ void handleButton() {
 
     // Check if this is the second press of a double-press
     if (waitingSecondPress && (now - lastReleaseTime) <= doublePressMs) {
-      // ── Double press: switch sensor ──
+      // -- Double press: switch sensor --
       doSensorSwitch();
       waitingSecondPress = false;
       startStopPending = false;
@@ -308,10 +309,10 @@ void handleButton() {
     }
   }
 
-  // Button held — check for long press
+  // Button held -- check for long press
   if (raw == LOW && buttonDown && !longPressHandled) {
     if ((now - buttonDownTime) >= longPressMs) {
-      // ── Long press: switch mode ──
+      // -- Long press: switch mode --
       if (currentMode == MODE_AUTO) {
         currentMode = MODE_MANUAL;
       } else {
@@ -333,7 +334,7 @@ void handleButton() {
     lastButtonChange = now;
 
     if (!longPressHandled) {
-      // First short press — wait for possible second press
+      // First short press -- wait for possible second press
       if (!waitingSecondPress) {
         waitingSecondPress = true;
         startStopPending = true;
@@ -352,7 +353,7 @@ void handleButton() {
   }
 }
 
-// ─── Setup ───────────────────────────────────────────────────
+// --- Setup -------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   Serial.println("Ali's Motor Controller - Stage 1 Bring-Up");
@@ -395,16 +396,16 @@ void setup() {
   Serial.println("m");
   Serial.print("Inductive: ");
   Serial.print(INDUCTIVE_PULSES_PER_M);
-  Serial.println(" pulses/m");
+  Serial.println(" pulses/m (debounce 10ms)");
   Serial.println("Short: START/STOP | Double: sensor | Long: AUTO/MANUAL");
 }
 
-// ─── Loop ────────────────────────────────────────────────────
+// --- Loop --------------------------------------------------------------------
 void loop() {
-  // ── Handle button (short/double/long press) ──
+  // -- Handle button (short/double/long press) --
   handleButton();
 
-  // ── Handle encoder rotation (MANUAL mode PWM adjustment) ──
+  // -- Handle encoder rotation (MANUAL mode PWM adjustment) --
   if (encoderChanged) {
     encoderChanged = false;
     if (currentMode == MODE_MANUAL) {
@@ -412,12 +413,12 @@ void loop() {
     }
   }
 
-  // ── AUTO mode: continuously update PWM based on speed ──
+  // -- AUTO mode: continuously update PWM based on speed --
   if (currentMode == MODE_AUTO && motorRunning) {
     applyPWM();
   }
 
-  // ── Periodic display refresh ──
+  // -- Periodic display refresh --
   if ((millis() - lastDisplayUpdate) > displayInterval) {
     lastDisplayUpdate = millis();
     updateDisplay();
