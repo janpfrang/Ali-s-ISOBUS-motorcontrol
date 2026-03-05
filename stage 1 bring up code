@@ -5,7 +5,7 @@
  *   - ESP32 NodeMCU
  *   - KY-040 Rotary Encoder (CLK=27, DT=26, SW=25)
  *   - I2C 20x4 LCD Display (SDA=13, SCL=14)
- *   - MOSFET driver PWM output (PWM=15, 10kHz)
+ *   - MOSFET driver PWM output (PWM=4, 10kHz)
  *   - Reed sensor for wheel speed (GPIO19)
  *   - Inductive sensor via PCF817 optocoupler (GPIO23)
  *   - [Stage 2] CAN transceiver SN65HVD230 (TX=22, RX=21)
@@ -17,6 +17,7 @@
  * Speed sources:
  *   - REED: 1 pulse per wheel revolution (410mm wheel)
  *   - IND:  Inductive sensor, 7.34 pulses per meter
+ *          Filtered: median5 + rate limiter (5 km/h per 250ms)
  *
  * Controls:
  *   - Short press:  START / STOP
@@ -36,7 +37,7 @@
 #define PIN_ENC_DT    26
 #define PIN_ENC_SW    25
 
-#define PIN_PWM       15
+#define PIN_PWM       4
 
 #define PIN_REED      19
 #define PIN_INDUCTIVE 23      // Inductive sensor via PCF817 optocoupler
@@ -60,6 +61,13 @@ const float wheelCircumM = (float)WHEEL_DIAMETER_MM / 1000.0 * PI;
 // Pulses per meter of ground travel
 #define INDUCTIVE_PULSES_PER_M  7.34
 
+// --- Inductive Sensor Filtering ----------------------------------------------
+#define IND_MEDIAN_SIZE      5       // median filter window
+#define IND_RATE_LIMIT_KMH   5.0    // max speed change per display interval
+#define IND_MIN_PERIOD_US   12000   // ~40 km/h max
+#define IND_MAX_PERIOD_US   1000000 // ~0.5 km/h min
+// (5 km/h per 250ms = 20 km/h per second max acceleration/deceleration)
+
 // --- Auto Mode Configuration -------------------------------------------------
 // Speed at which PWM reaches 100%
 #define AUTO_MAX_SPEED_KMH  20.0
@@ -71,8 +79,8 @@ LiquidCrystal_I2C lcd(0x27, 20, 4);
 enum Mode { MODE_MANUAL, MODE_AUTO };
 enum SpeedSource { SRC_REED, SRC_INDUCTIVE };
 
-Mode currentMode = MODE_MANUAL;
-SpeedSource speedSource = SRC_REED;
+Mode currentMode = MODE_AUTO;
+SpeedSource speedSource = SRC_INDUCTIVE;
 bool motorRunning = false;
 
 // --- Encoder State -----------------------------------------------------------
@@ -96,9 +104,16 @@ bool     startStopPending   = false;
 volatile unsigned long reedLastPulseUs = 0;
 volatile unsigned long reedPeriodUs    = 0;
 
-// --- Inductive Sensor State --------------------------------------------------
-volatile unsigned long indLastPulseUs = 0;
-volatile unsigned long indPeriodUs    = 0;
+// --- Inductive Sensor State (polling, not interrupt) -------------------------
+unsigned long indLastPulseUs = 0;
+unsigned long indPeriodUs = 0;
+unsigned long indPeriodBuf[IND_MEDIAN_SIZE] = {0};
+int           indBufIdx = 0;
+int           indBufCount = 0;
+float indFilteredKmh = 0.0;
+bool indPinLast = HIGH;             // HIGH = PC817 off (pull-up)
+bool indPinStable = HIGH;           // debounced state
+unsigned long indPinChangeUs = 0;   // when pin last changed
 
 // --- Timing ------------------------------------------------------------------
 unsigned long startTime = 0;
@@ -136,17 +151,40 @@ void IRAM_ATTR reedISR() {
   reedLastPulseUs = now;
 }
 
-// --- Inductive Sensor ISR (PC817 optocoupler debounce) -----------------------
-void IRAM_ATTR inductiveISR() {
+// --- Inductive Sensor Polling (replaces unreliable interrupt) -----------------
+// Called from loop(). Reads pin, debounces in software, detects falling edge.
+void pollInductive() {
+  bool raw = digitalRead(PIN_INDUCTIVE);
   unsigned long now = micros();
-  unsigned long elapsed = now - indLastPulseUs;
 
-  // Debounce: 10ms for PC817 optocoupler slow edges
-  // Still safe: min real period ~12.25ms at 40 km/h (7.34 p/m)
-  if (elapsed < 10000) return;
+  // If pin changed from last raw read, restart debounce timer
+  if (raw != indPinLast) {
+    indPinLast = raw;
+    indPinChangeUs = now;
+    return;
+  }
 
-  indPeriodUs = elapsed;
-  indLastPulseUs = now;
+  // Pin has been stable for >10ms? Accept new state
+  if (raw == indPinStable) return;  // no change
+  if ((now - indPinChangeUs) < 10000) return;  // not stable yet
+
+  // State transition confirmed
+  bool oldStable = indPinStable;
+  indPinStable = raw;
+
+  // Only act on HIGH->LOW (falling edge = PC817 turning on)
+  if (oldStable == HIGH && raw == LOW) {
+    unsigned long elapsed = now - indLastPulseUs;
+    indLastPulseUs = now;
+
+    // Skip first pulse and validate range
+    if (elapsed < IND_MIN_PERIOD_US || elapsed > IND_MAX_PERIOD_US) return;
+
+    indPeriodUs = elapsed;
+    indPeriodBuf[indBufIdx] = elapsed;
+    indBufIdx = (indBufIdx + 1) % IND_MEDIAN_SIZE;
+    if (indBufCount < IND_MEDIAN_SIZE) indBufCount++;
+  }
 }
 
 // --- Get Speed in km/h (from reed sensor) ------------------------------------
@@ -170,25 +208,49 @@ float getSpeedReed() {
   return kmh;
 }
 
-// --- Get Speed in km/h (from inductive sensor) -------------------------------
-float getSpeedInductive() {
-  unsigned long period;
+// --- Get Speed in km/h (from inductive sensor, median filtered) --------------
+float getSpeedInductiveRaw() {
   unsigned long lastPulse;
-
-  noInterrupts();
-  period    = indPeriodUs;
+  unsigned long bufCopy[IND_MEDIAN_SIZE];
+  int bc;
   lastPulse = indLastPulseUs;
-  interrupts();
-
-  if (period == 0) return 0.0;
+  bc = indBufCount;
+  for (int i = 0; i < IND_MEDIAN_SIZE; i++) bufCopy[i] = indPeriodBuf[i];
+  if (lastPulse == 0) return 0.0;
   if ((micros() - lastPulse) > sensorTimeoutUs) return 0.0;
+  if (bc == 0) return 0.0;
+  int n = (bc < IND_MEDIAN_SIZE) ? bc : IND_MEDIAN_SIZE;
+  unsigned long vb[IND_MEDIAN_SIZE] = {0};
+  int src = indBufIdx;
+  for (int i = n - 1; i >= 0; i--) {
+    src = (src - 1 + IND_MEDIAN_SIZE) % IND_MEDIAN_SIZE;
+    vb[i] = bufCopy[src];
+  }
+  // Sort only the n valid entries, pick middle
+  // Simple insertion sort on vb[0..n-1]
+  for (int i = 1; i < n; i++) {
+    unsigned long key = vb[i];
+    int j = i - 1;
+    while (j >= 0 && vb[j] > key) { vb[j + 1] = vb[j]; j--; }
+    vb[j + 1] = key;
+  }
+  unsigned long medPeriod = vb[n / 2];
+  if (medPeriod == 0) return 0.0;
+  float pps = 1000000.0 / (float)medPeriod;
+  float kmh = (pps / INDUCTIVE_PULSES_PER_M) * 3.6;
+  return (kmh > 40.0) ? 0.0 : kmh;
+}
 
-  // 7.34 pulses per meter -> distance per pulse = 1/7.34 m
-  float pulsesPerSec = 1000000.0 / (float)period;
-  float ms = pulsesPerSec / INDUCTIVE_PULSES_PER_M;  // m/s
-  float kmh = ms * 3.6;
-  if (kmh > 40.0) return 0.0;
-  return kmh;
+// --- Update rate-limited inductive speed -------------------------------------
+void updateFilteredIndSpeed() {
+  float rawKmh = getSpeedInductiveRaw();
+  float diff = rawKmh - indFilteredKmh;
+  if (diff > IND_RATE_LIMIT_KMH) indFilteredKmh += IND_RATE_LIMIT_KMH;
+  else if (diff < -IND_RATE_LIMIT_KMH) indFilteredKmh -= IND_RATE_LIMIT_KMH;
+  else indFilteredKmh = rawKmh;
+  if (indFilteredKmh < 0.0) indFilteredKmh = 0.0;
+  if (indFilteredKmh > 40.0) indFilteredKmh = 40.0;
+  if (rawKmh == 0.0 && indFilteredKmh < 1.0) indFilteredKmh = 0.0;
 }
 
 // --- Get Speed from active source --------------------------------------------
@@ -196,7 +258,7 @@ float getSpeedKmh() {
   if (speedSource == SRC_REED) {
     return getSpeedReed();
   } else {
-    return getSpeedInductive();
+    return indFilteredKmh;
   }
 }
 
@@ -377,9 +439,8 @@ void setup() {
   pinMode(PIN_REED, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_REED), reedISR, FALLING);
 
-  // Inductive sensor pin (PC817 module has onboard pull-up)
+  // Inductive sensor pin (PC817 output, polled - not interrupt)
   pinMode(PIN_INDUCTIVE, INPUT);
-  attachInterrupt(digitalPinToInterrupt(PIN_INDUCTIVE), inductiveISR, FALLING);
 
   // PWM setup (ESP32 Core 3.x API)
   ledcAttach(PIN_PWM, PWM_FREQ, PWM_RESOLUTION);
@@ -402,6 +463,9 @@ void setup() {
 
 // --- Loop --------------------------------------------------------------------
 void loop() {
+  // -- Poll inductive sensor (PC817 via software debounce) --
+  pollInductive();
+
   // -- Handle button (short/double/long press) --
   handleButton();
 
@@ -413,14 +477,10 @@ void loop() {
     }
   }
 
-  // -- AUTO mode: continuously update PWM based on speed --
-  if (currentMode == MODE_AUTO && motorRunning) {
-    applyPWM();
-  }
-
-  // -- Periodic display refresh --
   if ((millis() - lastDisplayUpdate) > displayInterval) {
     lastDisplayUpdate = millis();
+    updateFilteredIndSpeed();
+    if (currentMode == MODE_AUTO && motorRunning) applyPWM();
     updateDisplay();
   }
 }
