@@ -16,8 +16,9 @@
  *
  * Speed sources:
  *   - REED: 1 pulse per wheel revolution (410mm wheel)
+ *          Filtered: median5 + rate limiter (2.5 km/h per 250ms)
  *   - IND:  Inductive sensor, 7.34 pulses per meter
- *          Filtered: median5 + rate limiter (5 km/h per 250ms)
+ *          Filtered: median5 + rate limiter (2.5 km/h per 250ms)
  *
  * Controls:
  *   - Short press:  START / STOP
@@ -61,12 +62,19 @@ const float wheelCircumM = (float)WHEEL_DIAMETER_MM / 1000.0 * PI;
 // Pulses per meter of ground travel
 #define INDUCTIVE_PULSES_PER_M  7.34
 
+// --- Speed Filtering (shared) ------------------------------------------------
+#define MEDIAN_SIZE         5       // median filter window (both sensors)
+#define RATE_LIMIT_KMH      2.5    // max speed change per 250ms = 10 km/h/s
+
 // --- Inductive Sensor Filtering ----------------------------------------------
-#define IND_MEDIAN_SIZE      5       // median filter window
-#define IND_RATE_LIMIT_KMH   5.0    // max speed change per display interval
 #define IND_MIN_PERIOD_US   12000   // ~40 km/h max
 #define IND_MAX_PERIOD_US   1000000 // ~0.5 km/h min
-// (5 km/h per 250ms = 20 km/h per second max acceleration/deceleration)
+
+// --- Reed Sensor Filtering ---------------------------------------------------
+// At 40 km/h: 11.11 m/s / 1.288m circ = 8.63 Hz -> period 115,875 us
+// At 0.3 km/h: 0.083 m/s / 1.288m = 0.065 Hz -> period ~15,400,000 us
+#define REED_MIN_PERIOD_US  40000    // ~116 km/h safety margin
+#define REED_MAX_PERIOD_US  10000000 // ~0.46 km/h
 
 // --- Auto Mode Configuration -------------------------------------------------
 // Speed at which PWM reaches 100%
@@ -103,11 +111,16 @@ bool     startStopPending   = false;
 // --- Reed Sensor State -------------------------------------------------------
 volatile unsigned long reedLastPulseUs = 0;
 volatile unsigned long reedPeriodUs    = 0;
+volatile bool          reedFirstPulse  = true;
+volatile unsigned long reedPeriodBuf[MEDIAN_SIZE] = {0};
+volatile int           reedBufIdx = 0;
+volatile int           reedBufCount = 0;
+float reedFilteredKmh = 0.0;
 
 // --- Inductive Sensor State (polling, not interrupt) -------------------------
 unsigned long indLastPulseUs = 0;
 unsigned long indPeriodUs = 0;
-unsigned long indPeriodBuf[IND_MEDIAN_SIZE] = {0};
+unsigned long indPeriodBuf[MEDIAN_SIZE] = {0};
 int           indBufIdx = 0;
 int           indBufCount = 0;
 float indFilteredKmh = 0.0;
@@ -143,87 +156,123 @@ void IRAM_ATTR encoderISR() {
 void IRAM_ATTR reedISR() {
   unsigned long now = micros();
   unsigned long elapsed = now - reedLastPulseUs;
-
-  // Debounce: ignore pulses faster than 5ms
-  if (elapsed < 5000) return;
-
-  reedPeriodUs = elapsed;
+  if (elapsed < 5000) return;         // 5ms debounce
   reedLastPulseUs = now;
+  if (reedFirstPulse) { reedFirstPulse = false; return; }
+  if (elapsed < REED_MIN_PERIOD_US || elapsed > REED_MAX_PERIOD_US) return;
+  reedPeriodUs = elapsed;
+  reedPeriodBuf[reedBufIdx] = elapsed;
+  reedBufIdx = (reedBufIdx + 1) % MEDIAN_SIZE;
+  if (reedBufCount < MEDIAN_SIZE) reedBufCount++;
 }
 
 // --- Inductive Sensor Polling (replaces unreliable interrupt) -----------------
-// Called from loop(). Reads pin, debounces in software, detects falling edge.
+// Only debounces the falling edge (HIGH->LOW). Rising edge passes immediately.
 void pollInductive() {
   bool raw = digitalRead(PIN_INDUCTIVE);
   unsigned long now = micros();
 
-  // If pin changed from last raw read, restart debounce timer
-  if (raw != indPinLast) {
-    indPinLast = raw;
-    indPinChangeUs = now;
-    return;
-  }
+  if (indPinStable == HIGH) {
+    // Waiting for falling edge (sensor activating)
+    if (raw == LOW) {
+      // Pin just went low - start or continue debounce
+      if (indPinLast == HIGH) {
+        // First LOW reading, start timer
+        indPinLast = LOW;
+        indPinChangeUs = now;
+      } else if ((now - indPinChangeUs) >= 10000) {
+        // Stable LOW for 10ms - accept falling edge
+        indPinStable = LOW;
 
-  // Pin has been stable for >10ms? Accept new state
-  if (raw == indPinStable) return;  // no change
-  if ((now - indPinChangeUs) < 10000) return;  // not stable yet
+        unsigned long elapsed = now - indLastPulseUs;
+        indLastPulseUs = now;
 
-  // State transition confirmed
-  bool oldStable = indPinStable;
-  indPinStable = raw;
-
-  // Only act on HIGH->LOW (falling edge = PC817 turning on)
-  if (oldStable == HIGH && raw == LOW) {
-    unsigned long elapsed = now - indLastPulseUs;
-    indLastPulseUs = now;
-
-    // Skip first pulse and validate range
-    if (elapsed < IND_MIN_PERIOD_US || elapsed > IND_MAX_PERIOD_US) return;
-
-    indPeriodUs = elapsed;
-    indPeriodBuf[indBufIdx] = elapsed;
-    indBufIdx = (indBufIdx + 1) % IND_MEDIAN_SIZE;
-    if (indBufCount < IND_MEDIAN_SIZE) indBufCount++;
+        if (elapsed >= IND_MIN_PERIOD_US && elapsed <= IND_MAX_PERIOD_US) {
+          indPeriodUs = elapsed;
+          indPeriodBuf[indBufIdx] = elapsed;
+          indBufIdx = (indBufIdx + 1) % MEDIAN_SIZE;
+          if (indBufCount < MEDIAN_SIZE) indBufCount++;
+        }
+      }
+    } else {
+      // Still HIGH or bounced back to HIGH - reset
+      indPinLast = HIGH;
+    }
+  } else {
+    // Pin is confirmed LOW, waiting for release (rising edge)
+    // No debounce needed - accept immediately
+    if (raw == HIGH) {
+      indPinStable = HIGH;
+      indPinLast = HIGH;
+    }
   }
 }
 
-// --- Get Speed in km/h (from reed sensor) ------------------------------------
-float getSpeedReed() {
-  unsigned long period;
+// --- Get Raw Speed in km/h (from reed sensor, median filtered) ---------------
+float getSpeedReedRaw() {
   unsigned long lastPulse;
+  unsigned long bufCopy[MEDIAN_SIZE];
+  int bc;
 
   noInterrupts();
-  period    = reedPeriodUs;
   lastPulse = reedLastPulseUs;
+  bc = reedBufCount;
+  for (int i = 0; i < MEDIAN_SIZE; i++) bufCopy[i] = reedPeriodBuf[i];
   interrupts();
 
-  if (period == 0) return 0.0;
+  if (lastPulse == 0) return 0.0;
   if ((micros() - lastPulse) > sensorTimeoutUs) return 0.0;
+  if (bc == 0) return 0.0;
 
-  // 1 pulse per revolution
-  float rps = 1000000.0 / (float)period;
-  float ms = rps * wheelCircumM;
-  float kmh = ms * 3.6;
-  if (kmh > 40.0) return 0.0;
-  return kmh;
+  int n = (bc < MEDIAN_SIZE) ? bc : MEDIAN_SIZE;
+  unsigned long vb[MEDIAN_SIZE] = {0};
+  int src = reedBufIdx;
+  for (int i = n - 1; i >= 0; i--) {
+    src = (src - 1 + MEDIAN_SIZE) % MEDIAN_SIZE;
+    vb[i] = bufCopy[src];
+  }
+  for (int i = 1; i < n; i++) {
+    unsigned long key = vb[i];
+    int j = i - 1;
+    while (j >= 0 && vb[j] > key) { vb[j + 1] = vb[j]; j--; }
+    vb[j + 1] = key;
+  }
+  unsigned long medPeriod = vb[n / 2];
+  if (medPeriod == 0) return 0.0;
+
+  float rps = 1000000.0 / (float)medPeriod;
+  float kmh = rps * wheelCircumM * 3.6;
+  return (kmh > 40.0) ? 0.0 : kmh;
+}
+
+// --- Update rate-limited reed speed ------------------------------------------
+void updateFilteredReedSpeed() {
+  float raw = getSpeedReedRaw();
+  float diff = raw - reedFilteredKmh;
+  if (diff > RATE_LIMIT_KMH) reedFilteredKmh += RATE_LIMIT_KMH;
+  else if (diff < -RATE_LIMIT_KMH) reedFilteredKmh -= RATE_LIMIT_KMH;
+  else reedFilteredKmh = raw;
+  if (reedFilteredKmh < 0.0) reedFilteredKmh = 0.0;
+  if (reedFilteredKmh > 40.0) reedFilteredKmh = 40.0;
+  if (raw == 0.0 && reedFilteredKmh < 1.0) reedFilteredKmh = 0.0;
 }
 
 // --- Get Speed in km/h (from inductive sensor, median filtered) --------------
 float getSpeedInductiveRaw() {
   unsigned long lastPulse;
-  unsigned long bufCopy[IND_MEDIAN_SIZE];
+  unsigned long bufCopy[MEDIAN_SIZE];
   int bc;
   lastPulse = indLastPulseUs;
   bc = indBufCount;
-  for (int i = 0; i < IND_MEDIAN_SIZE; i++) bufCopy[i] = indPeriodBuf[i];
+  for (int i = 0; i < MEDIAN_SIZE; i++) bufCopy[i] = indPeriodBuf[i];
   if (lastPulse == 0) return 0.0;
   if ((micros() - lastPulse) > sensorTimeoutUs) return 0.0;
   if (bc == 0) return 0.0;
-  int n = (bc < IND_MEDIAN_SIZE) ? bc : IND_MEDIAN_SIZE;
-  unsigned long vb[IND_MEDIAN_SIZE] = {0};
+  int n = (bc < MEDIAN_SIZE) ? bc : MEDIAN_SIZE;
+  unsigned long vb[MEDIAN_SIZE] = {0};
   int src = indBufIdx;
   for (int i = n - 1; i >= 0; i--) {
-    src = (src - 1 + IND_MEDIAN_SIZE) % IND_MEDIAN_SIZE;
+    src = (src - 1 + MEDIAN_SIZE) % MEDIAN_SIZE;
     vb[i] = bufCopy[src];
   }
   // Sort only the n valid entries, pick middle
@@ -245,8 +294,8 @@ float getSpeedInductiveRaw() {
 void updateFilteredIndSpeed() {
   float rawKmh = getSpeedInductiveRaw();
   float diff = rawKmh - indFilteredKmh;
-  if (diff > IND_RATE_LIMIT_KMH) indFilteredKmh += IND_RATE_LIMIT_KMH;
-  else if (diff < -IND_RATE_LIMIT_KMH) indFilteredKmh -= IND_RATE_LIMIT_KMH;
+  if (diff > RATE_LIMIT_KMH) indFilteredKmh += RATE_LIMIT_KMH;
+  else if (diff < -RATE_LIMIT_KMH) indFilteredKmh -= RATE_LIMIT_KMH;
   else indFilteredKmh = rawKmh;
   if (indFilteredKmh < 0.0) indFilteredKmh = 0.0;
   if (indFilteredKmh > 40.0) indFilteredKmh = 40.0;
@@ -256,7 +305,7 @@ void updateFilteredIndSpeed() {
 // --- Get Speed from active source --------------------------------------------
 float getSpeedKmh() {
   if (speedSource == SRC_REED) {
-    return getSpeedReed();
+    return reedFilteredKmh;
   } else {
     return indFilteredKmh;
   }
@@ -479,6 +528,7 @@ void loop() {
 
   if ((millis() - lastDisplayUpdate) > displayInterval) {
     lastDisplayUpdate = millis();
+    updateFilteredReedSpeed();
     updateFilteredIndSpeed();
     if (currentMode == MODE_AUTO && motorRunning) applyPWM();
     updateDisplay();
