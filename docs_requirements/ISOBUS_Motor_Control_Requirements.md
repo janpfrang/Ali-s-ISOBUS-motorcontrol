@@ -1,9 +1,9 @@
 # ISOBUS Motor Control — Requirements Specification
 
 **Project:** Proportional DC Motor Control via ISOBUS (ISO 11783)
-**Version:** 1.0
-**Date:** 2026-02-22
-**Status:** Draft — For Review
+**Version:** 1.1
+**Date:** 2026-04-07
+**Status:** Released 
 
 ---
 
@@ -11,7 +11,7 @@
 
 A 12V DC motor shall be controlled proportionally to the vehicle ground speed. The system is developed in two stages:
 
-**Stage 1** — Basic standalone motor control with local UI (rotary encoder + LCD display), local speed measurement via reed sensor, and two operating modes (Auto / Manual). No ISOBUS communication. This stage validates hardware, wiring, and core motor control logic.
+**Stage 1** — Basic standalone motor control with local UI (rotary encoder + LCD display), local speed measurement via reed sensor and inductive NPN sensor (already existing on machine), and two operating modes (Auto / Manual). No ISOBUS communication. This stage validates hardware, wiring, and core motor control logic.
 
 **Stage 2** — Full ISOBUS integration (ISO 11783 / CAN 2.0B at 250 kbit/s). Vehicle speed is received over ISOBUS from the CCI 100 terminal. A Virtual Terminal (VT) user interface replaces the local LCD for operator interaction. Additional sensors (lift position) are integrated. The local LCD and encoder remain available as a fallback interface.
 
@@ -23,21 +23,21 @@ The control unit for both stages is an ESP32 NodeMCU microcontroller.
 
 ### FR-01: Motor Speed Control — Proportional to Speed
 
-*Stage 1: Speed from reed sensor. Stage 2: Speed from ISOBUS PGN.*
+*Stage 1: Speed from reed sensor or inductive sensor. Stage 2: Speed from ISOBUS PGN.*
 
 | ID | Requirement | Notes |
 |----|-------------|-------|
 | FR-01.1 | The motor speed shall be proportional to the vehicle ground speed. | Linear interpolation between defined points (see FR-01.3). |
-| FR-01.2 | The motor is driven via PWM signal (10 kHz, 8-bit resolution) to a MOSFET driver module. | DollaTek 15A 400W dual-MOSFET module. |
-| FR-01.3 | The PWM duty cycle mapping shall be: | Piecewise linear interpolation. |
+| FR-01.2 | The motor is driven via PWM signal (10 kHz, 8-bit resolution) to a MOSFET driver module. | DollaTek 15A 400W dual-MOSFET module. PWM on GPIO4. |
+| FR-01.3 | The PWM duty cycle mapping shall be: | Piecewise linear interpolation (Stage 2). Stage 1 uses simple linear 0–20 km/h. |
 | | — 0 km/h → 0% PWM (motor off) | |
 | | — 9 km/h → 45% PWM | |
 | | — 18 km/h → 90% PWM | |
 | | — 20 km/h → 100% PWM (maximum) | |
 | FR-01.4 | Above 20 km/h the PWM duty cycle shall be clamped at 100%. | |
-| FR-01.5 | Stage 1: If no reed sensor pulse is received for >2 seconds, speed shall read 0 km/h. | Software timeout. |
-| FR-01.6 | Stage 2: If no ISOBUS vehicle speed data is received for >5 seconds, the motor shall stop (0% PWM) and the system shall enter Stopped mode. | Alarm shown on VT (see FR-03.6). |
-| FR-01.7 | Speed values above 40 km/h shall be discarded as noise. | Applies to reed sensor in Stage 1. |
+| FR-01.5 | Stage 1: If no sensor pulse is received for >2 seconds, speed shall read 0 km/h. | Software timeout. Applies to both reed and inductive sensor. |
+| FR-01.6 | Stage 2: If no ISOBUS vehicle speed data is received for >5 seconds, the motor shall stop (0% PWM) and the system shall enter Stopped mode. | Alarm shown on VT (see FR-06.7). |
+| FR-01.7 | Speed values above 40 km/h shall be discarded as noise. | Applies to both reed and inductive sensors. |
 
 ### FR-02: Operating Modes
 
@@ -46,10 +46,10 @@ The control unit for both stages is an ESP32 NodeMCU microcontroller.
 | ID | Requirement | Notes |
 |----|-------------|-------|
 | FR-02.1 | The system shall support two operating modes: AUTO and MANUAL. | |
-| FR-02.2 | AUTO mode: PWM duty cycle is proportional to measured speed (per FR-01.3 mapping). Stage 1 uses reed sensor speed; Stage 2 uses ISOBUS ground speed. | Stage 1: simple linear 0–20 km/h. Stage 2: piecewise linear per FR-01.3. |
+| FR-02.2 | AUTO mode: PWM duty cycle is proportional to measured speed (per FR-01.3 mapping). Stage 1 uses local sensor speed; Stage 2 uses ISOBUS ground speed. | Stage 1: simple linear 0–20 km/h. Stage 2: piecewise linear per FR-01.3. |
 | FR-02.3 | MANUAL mode: PWM duty cycle is set directly by operator via rotary encoder (0–100%). | Encoder value persists when switching modes. |
 | FR-02.4 | Mode can be switched at any time, including while the motor is running. | |
-| FR-02.5 | On power-up / boot, the system shall default to MANUAL mode, Stopped state. | |
+| FR-02.5 | On power-up / boot, the system shall default to AUTO mode, Stopped state, with inductive sensor as speed source. | |
 
 ### FR-03: Start/Stop Control
 
@@ -67,29 +67,70 @@ The control unit for both stages is an ESP32 NodeMCU microcontroller.
 
 | ID | Requirement | Notes |
 |----|-------------|-------|
-| FR-04.1 | A 20x4 character I2C LCD shall display system status. | I2C address 0x27 (configurable). |
-| FR-04.2 | LCD Row 0: Title and current mode indicator ([AUTO] or [MANUAL]). | |
+| FR-04.1 | A 20x4 character I2C LCD shall display system status. | I2C address 0x27 (configurable). SDA=GPIO13, SCL=GPIO14. |
+| FR-04.2 | LCD Row 0: Title, current mode indicator ([AUTO] or [MANU]), and active speed sensor (REED or IND). | Format: `Ali [AUTO] spd:IND` |
 | FR-04.3 | LCD Row 1: Current PWM duty cycle (%). In AUTO mode, annotated with "(auto)". | |
-| FR-04.4 | LCD Row 2: Current speed in km/h (from reed sensor). | |
+| FR-04.4 | LCD Row 2: Current speed in km/h (from active sensor). | |
 | FR-04.5 | LCD Row 3: Run state (RUN / STOP) and uptime (MM:SS). | |
 | FR-04.6 | Display refresh interval: 250 ms. | |
-| FR-04.7 | KY-040 rotary encoder with push button for all local input. | |
-| FR-04.8 | Short press (<1s): Toggle START / STOP. | 50 ms debounce. |
+| FR-04.7 | KY-040 rotary encoder with push button for all local input. | CLK=GPIO27, DT=GPIO26, SW=GPIO25. |
+| FR-04.8 | Short press (<1s): Toggle START / STOP. | 50 ms debounce. 400ms delay due to double-press detection. |
 | FR-04.9 | Long press (≥1s): Switch between AUTO and MANUAL mode. | |
-| FR-04.10 | Rotation: Adjust PWM % in MANUAL mode (0–100, 1% steps). | No effect in AUTO mode. |
+| FR-04.10 | Double press (two presses within 400ms): Switch speed sensor (REED ↔ IND). | |
+| FR-04.11 | Rotation: Adjust PWM % in MANUAL mode (0–100, 1% steps). | No effect in AUTO mode. |
 
-### FR-05: Speed Measurement (Stage 1)
+### FR-05: Speed Measurement — Reed Sensor
 
-*Stage 1 only. Stage 2 replaces with ISOBUS vehicle speed.*
+*Stage 1 speed source option. Selectable at runtime.*
 
 | ID | Requirement | Notes |
 |----|-------------|-------|
-| FR-05.1 | Ground speed shall be measured using a reed sensor mounted on a wheel. | One magnet per revolution. |
+| FR-05.1 | Ground speed shall be measurable using a reed sensor mounted on a wheel. | One magnet per revolution. |
 | FR-05.2 | Wheel diameter: 410 mm (configurable constant). | Circumference ≈ 1.288 m. |
-| FR-05.3 | Speed is calculated from the period between consecutive reed sensor pulses. | Interrupt-driven on falling edge. |
+| FR-05.3 | Speed is calculated from the period between consecutive reed sensor pulses. | Interrupt-driven on falling edge. GPIO19. |
 | FR-05.4 | Reed sensor debounce: ignore pulses faster than 5 ms. | Prevents false triggers. |
-| FR-05.5 | If no pulse is received for >2 seconds, speed shall read 0 km/h. | Wheel stopped or stalled. |
-| FR-05.6 | Reed sensor cable length up to 6 m shall be supported. | Requires external 4.7kΩ pull-up + 100nF filter cap. Shielded/twisted pair cable recommended. |
+| FR-05.5 | Valid pulse period range: 40,000 µs – 10,000,000 µs. | Corresponds to ~116 km/h – ~0.46 km/h safety bounds. |
+| FR-05.6 | The first pulse after power-on shall be discarded (no valid period yet). | Prevents bogus initial reading. |
+| FR-05.7 | If no pulse is received for >2 seconds, speed shall read 0 km/h. | Wheel stopped or stalled. |
+| FR-05.8 | Reed sensor cable length up to 6 m shall be supported. | Requires external 4.7kΩ pull-up + 100nF filter cap. Shielded/twisted pair cable recommended. |
+
+### FR-05b: Speed Measurement — Inductive NPN Sensor
+
+*Stage 1 speed source option. Inductive NPN sensor already existing on machine. Selectable at runtime.*
+
+| ID | Requirement | Notes |
+|----|-------------|-------|
+| FR-05b.1 | Ground speed shall be measurable using an inductive NPN proximity sensor on a spinning wheel disc. | Existing sensor on machine. |
+| FR-05b.2 | The sensor outputs ~11V pulses, galvanically isolated via a PC817 optocoupler module (2-channel). | Output pins: G=GND, IN1=signal to GPIO23. Active low. |
+| FR-05b.3 | Sensor pulse rate: 7.34 pulses per meter of ground travel (configurable constant). | Speed = (pulses/sec) / 7.34 × 3.6 km/h. |
+| FR-05b.4 | The inductive sensor shall be read by polling (not interrupt) due to PC817 optocoupler bounce characteristics. | Polled every loop iteration. |
+| FR-05b.5 | Software debounce: falling edge (HIGH→LOW) requires 10 ms stable LOW before acceptance. Rising edge accepted immediately. | Eliminates optocoupler bounce. |
+| FR-05b.6 | Valid pulse period range: 12,000 µs – 1,000,000 µs. | Corresponds to ~40 km/h – ~0.5 km/h. |
+| FR-05b.7 | If no pulse is received for >2 seconds, speed shall read 0 km/h. | |
+| FR-05b.8 | GPIO23 configured as INPUT (no internal pull-up). PC817 module has onboard pull-up. | |
+
+### FR-05c: Speed Filtering
+
+*Applies to both reed and inductive speed sources.*
+
+| ID | Requirement | Notes |
+|----|-------------|-------|
+| FR-05c.1 | Both speed sensors shall apply a median filter with a window size of 5 samples. | Rejects single outlier pulses. |
+| FR-05c.2 | The median filter operates on the raw pulse period values, not on calculated km/h. | Period-domain filtering is more robust. |
+| FR-05c.3 | A rate limiter shall constrain speed changes to a maximum of 2.5 km/h per display refresh interval (250 ms). | Equivalent to 10 km/h/s max acceleration/deceleration. |
+| FR-05c.4 | When raw speed reads 0 km/h and filtered speed is below 1 km/h, filtered speed shall snap to 0. | Prevents slow drift to zero. |
+| FR-05c.5 | Filtered speed is updated once per display refresh cycle (250 ms). | Synchronized with display update. |
+
+### FR-05d: Speed Source Selection
+
+*Runtime selection between reed and inductive sensor.*
+
+| ID | Requirement | Notes |
+|----|-------------|-------|
+| FR-05d.1 | The operator shall be able to switch between reed and inductive speed source at runtime. | Via double-press on encoder button (see FR-04.10). |
+| FR-05d.2 | Both sensors run continuously regardless of which is selected. | Inactive sensor data stays fresh for instant switching. |
+| FR-05d.3 | On power-up, the inductive sensor shall be the default speed source. | |
+| FR-05d.4 | The active speed source shall be displayed on LCD Row 0 (see FR-04.2). | "REED" or "IND". |
 
 ### FR-06: Virtual Terminal (VT) User Interface (Stage 2)
 
@@ -142,13 +183,14 @@ The control unit for both stages is an ESP32 NodeMCU microcontroller.
 
 | Function | GPIO | Stage | Notes |
 |----------|------|-------|-------|
-| I2C SDA (LCD) | GPIO5 | 1+2 | |
-| I2C SCL (LCD) | GPIO4 | 1+2 | |
-| Encoder CLK | GPIO14 | 1+2 | Interrupt on CHANGE |
-| Encoder DT | GPIO27 | 1+2 | |
-| Encoder SW | GPIO32 | 1+2 | Internal pull-up |
-| PWM Output | GPIO18 | 1+2 | 10 kHz, 8-bit, to MOSFET module |
-| Reed Sensor | GPIO25 | 1 | FALLING edge interrupt. Ext 4.7kΩ pull-up + 100nF cap for long cables. |
+| I2C SDA (LCD) | GPIO13 | 1+2 | |
+| I2C SCL (LCD) | GPIO14 | 1+2 | |
+| Encoder CLK | GPIO27 | 1+2 | Interrupt on CHANGE |
+| Encoder DT | GPIO26 | 1+2 | |
+| Encoder SW | GPIO25 | 1+2 | Internal pull-up |
+| PWM Output | GPIO4 | 1+2 | 10 kHz, 8-bit, to MOSFET module |
+| Reed Sensor | GPIO19 | 1+2 | FALLING edge interrupt. Ext 4.7kΩ pull-up + 100nF cap. |
+| Inductive Sensor | GPIO23 | 1+2 | Polled input via PC817 optocoupler. No internal pull-up (module has onboard pull-up). |
 | CAN TX | GPIO22 | 2 | To SN65HVD230 |
 | CAN RX | GPIO21 | 2 | From SN65HVD230 |
 | Lift Sensor | TBD | 2 | **[OPEN]** |
@@ -164,6 +206,7 @@ The control unit for both stages is an ESP32 NodeMCU microcontroller.
 | NFR-01.7 | Transient protection: P6KE20A TVS diode on 12V input, close to DC/DC. | Cathode (stripe) to +12V. |
 | NFR-01.8 | Input decoupling: 100µF electrolytic + 100nF ceramic on 12V input. | |
 | NFR-01.9 | Bulk capacitor: 470µF–1000µF (25V) recommended near MOSFET module power input. | **[OPEN]** To be added for Stage 2 / field use. |
+| NFR-01.10 | Inductive sensor signal isolation: PC817 optocoupler module (2-channel). | Input: 3.6–24V. Output: active low. Screw terminals for field wiring. |
 
 ### NFR-02: Software / Development Environment
 
@@ -183,6 +226,7 @@ The control unit for both stages is an ESP32 NodeMCU microcontroller.
 | NFR-03.3 | Motor output from MOSFET module: twisted wires. | |
 | NFR-03.4 | Reed sensor signal conditioning: 4.7kΩ external pull-up to 3.3V + 100nF ceramic cap to GND at GPIO pin. | Low-pass filter cutoff ≈340 kHz. |
 | NFR-03.5 | Motor power wires and signal wires shall maintain ≥10 cm separation where possible. | |
+| NFR-03.6 | Inductive sensor cable: CAT 5/6 stranded, 24 AWG. Use one twisted pair per signal direction with unused wire of pair to ESP32 GND. All other unused pairs and shield to GND of DC/DC on 3.3V (low voltage) side. | |
 
 ---
 
@@ -191,8 +235,10 @@ The control unit for both stages is an ESP32 NodeMCU microcontroller.
 | Phase | Stage | Description | Notes |
 |-------|-------|-------------|-------|
 | Phase 1a | 1 | Bench test: LCD, encoder, PWM output verification with oscilloscope/multimeter. | Completed. |
-| Phase 1b | 1 | Bench test: Reed sensor speed measurement with manual magnet passes. | |
-| Phase 1c | 1 | Bench test: Motor running with MOSFET module, both AUTO and MANUAL modes. | |
+| Phase 1b | 1 | Bench test: Reed sensor speed measurement with manual magnet passes. | Completed. |
+| Phase 1c | 1 | Bench test: Inductive sensor speed measurement via PC817 optocoupler. | Completed. |
+| Phase 1d | 1 | Bench test: Motor running with MOSFET module, both AUTO and MANUAL modes. | Completed. |
+| Phase 1e | 1 | Bench test: Sensor switching (double-press), median filtering, rate limiter verification. | Completed. |
 | Phase 2a | 2 | Desktop simulation: Python script simulates CCI 100 + vehicle speed over USB-CAN adapter. | Use python-can. VT simulation optional (see Q3). |
 | Phase 2b | 2 | Bench test with real CCI 100 terminal (standalone, not in vehicle). | |
 | Phase 2c | 2 | Bench test: Lift position sensor integration. | |
@@ -211,7 +257,7 @@ The control unit for both stages is an ESP32 NodeMCU microcontroller.
 | Q5 | 2 | **Power supply details:** Confirm DC/DC converter specifications and whether ESP32 USB power is used during development only. |
 | Q6 | 2 | **Bulk decoupling capacitor** (470µF–1000µF) near MOSFET module: recommended before field deployment. |
 | Q7 | 2 | **SN65HVD230 CAN TX pull-up:** 10kΩ to 3.3V recommended to prevent bus garbage during ESP32 boot/reset. |
-| Q8 | 1 | **Stage 1 AUTO mode** uses simple linear mapping (0–20 km/h). Stage 2 uses the piecewise linear mapping from FR-01.3. Confirm if Stage 1 should also use piecewise mapping. |
+| ~~Q8~~ | ~~1~~ | ~~Stage 1 AUTO mode uses simple linear mapping.~~ **Resolved:** Stage 1 confirmed to use simple linear 0–20 km/h. Piecewise mapping deferred to Stage 2. |
 
 ---
 
@@ -220,11 +266,13 @@ The control unit for both stages is an ESP32 NodeMCU microcontroller.
 ### Stage 1 Architecture
 
 ```
-Reed Sensor → GPIO25 (interrupt) → ESP32 → GPIO18 (PWM 10kHz) → MOSFET Module → 12V DC Motor
+Reed Sensor ──→ GPIO19 (interrupt, FALLING) ──→ ESP32 ──→ GPIO4 (PWM 10kHz) ──→ MOSFET Module ──→ 12V DC Motor
+                                                  ↑
+Inductive NPN Sensor ──→ PC817 Optocoupler ──→ GPIO23 (polled)
+                                                  ↑
+KY-040 Encoder ──→ GPIO27/26/25 ──→ ESP32 ──→ I2C (GPIO13/14) ──→ 20x4 LCD Display
 
-KY-040 Encoder → GPIO14/27/32 → ESP32 → I2C (GPIO5/4) → 20x4 LCD Display
-
-12V (ISOBUS/Trailer) → TVS + Caps → DC/DC 3.3V → ESP32
+12V (ISOBUS/Trailer) ──→ TVS + Caps ──→ DC/DC 3.3V ──→ ESP32
 ```
 
 ### Stage 2 Architecture (additions)
@@ -243,13 +291,13 @@ Local LCD + Encoder retained as fallback interface.
 
 | Aspect | Assessment |
 |--------|------------|
-| **Stage 1 Status** | Core hardware validated. LCD, encoder, MOSFET PWM, and reed sensor operational. AUTO and MANUAL modes implemented. |
-| **Clarity** | Good. Key parameters (speed mapping, pins, hardware, timeouts) are well defined per stage. |
-| **Completeness** | Stage 1 requirements complete. Stage 2 has open questions (Q1–Q8). |
+| **Stage 1 Status** | Complete. LCD, encoder, MOSFET PWM, reed sensor, inductive sensor, median filtering, rate limiting, dual-sensor selection all operational. AUTO and MANUAL modes working. |
+| **Clarity** | Good. Key parameters (speed mapping, pins, hardware, timeouts, filtering) are well defined per stage. |
+| **Completeness** | Stage 1 requirements complete and matched to code. Stage 2 has open questions (Q1–Q7). |
 | **Feasibility** | Hardware is feasible. ISOBUS stack (AgIsoStack++) mitigates protocol complexity for Stage 2. |
-| **Testability** | Phased approach with clear stage boundaries. Phase 1a completed. |
-| **Safety** | Signal loss timeout, boot-up default (Stopped), speed clamping (40 km/h), and lift interlock (Stage 2) defined. |
+| **Testability** | Phased approach with clear stage boundaries. Stage 1 phases 1a–1e completed. |
+| **Safety** | Signal loss timeout, boot-up default (Stopped), speed clamping (40 km/h), median filtering, rate limiting, and lift interlock (Stage 2) defined. |
 
 ---
 
-*Please review the open questions (Q1–Q8) so this document can be finalized as version 1.0.*
+*Please review the remaining open questions (Q1–Q7) so this document can be finalized.*
