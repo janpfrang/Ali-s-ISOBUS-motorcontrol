@@ -1,0 +1,9 @@
+upload 
+isobus_speed_rx.ino
+
+
+kill open python Tasks in CMD:
+taskkill /F /IM python.exe
+
+start:
+python isobus_speed_sim.py --ramp
