@@ -5,6 +5,9 @@ on:
     branches: ["**"]
   pull_request:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -26,7 +29,7 @@ jobs:
       - name: Update index & install ESP32 core
         run: |
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32@2.0.14
+          arduino-cli core install esp32:esp32@3.2.0
 
       - name: Install Libraries
         run: |
@@ -44,7 +47,7 @@ jobs:
         run: |
           arduino-cli compile \
             --fqbn esp32:esp32:nodemcu-32s \
-            --warnings more \
+            --warnings none \
             --output-dir build/ \
             stage1_bringup/
 
