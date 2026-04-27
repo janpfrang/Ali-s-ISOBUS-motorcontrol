@@ -30,12 +30,15 @@ jobs:
 
       - name: Install Libraries
         run: |
-          # LCD Library (LiquidCrystal_I2C.h)
           arduino-cli lib install "LiquidCrystal I2C@1.1.2"
-          # Wire.h ist Teil des ESP32 Core - keine separate Installation nötig
 
       - name: Show installed libs (Audit-Trail)
         run: arduino-cli lib list
+
+      - name: Prepare Sketch
+        run: |
+          mkdir -p stage1_bringup
+          cp stage_1_bring_up_code.ino stage1_bringup/stage1_bringup.ino
 
       - name: Compile Sketch
         run: |
@@ -43,7 +46,7 @@ jobs:
             --fqbn esp32:esp32:nodemcu-32s \
             --warnings more \
             --output-dir build/ \
-            sketch/
+            stage1_bringup/
 
       - name: Upload Firmware Artifact
         uses: actions/upload-artifact@v4
