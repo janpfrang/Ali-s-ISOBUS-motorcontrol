@@ -1,5 +1,5 @@
 /*
- * Ali's Motor Controller - Stage 1 Bring-Up
+ * Ali's Motor Controller - Stage 1 Bring-Up working
  * 
  * Hardware:
  *   - ESP32 NodeMCU
