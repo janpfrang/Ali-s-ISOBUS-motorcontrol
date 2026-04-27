@@ -1,0 +1,56 @@
+name: Build Ali's Motor Controller
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Init arduino-cli config
+        run: arduino-cli config init
+
+      - name: Add ESP32 board manager URL
+        run: |
+          arduino-cli config add board_manager.additional_urls \
+            https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+
+      - name: Update index & install ESP32 core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@2.0.14
+
+      - name: Install Libraries
+        run: |
+          # LCD Library (LiquidCrystal_I2C.h)
+          arduino-cli lib install "LiquidCrystal I2C@1.1.2"
+          # Wire.h ist Teil des ESP32 Core - keine separate Installation nötig
+
+      - name: Show installed libs (Audit-Trail)
+        run: arduino-cli lib list
+
+      - name: Compile Sketch
+        run: |
+          arduino-cli compile \
+            --fqbn esp32:esp32:nodemcu-32s \
+            --warnings more \
+            --output-dir build/ \
+            sketch/
+
+      - name: Upload Firmware Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.sha }}
+          path: |
+            build/*.bin
+            build/*.elf
+            build/*.map
+          retention-days: 90
